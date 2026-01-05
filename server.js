@@ -74,7 +74,16 @@ app.post("/webhook", async (req, res) => {
         if (text === "状況" || text === "確認" || text === "status") {
             const replyText = `現在の投函数: ${currentCount}回\n最終検知: ${lastReceivedTime}`;
             await replyMessage(event.replyToken, replyText);
-        } else {
+        } else if (text === "リセット") {
+         currentCount = 0; // サーバーのカウントを0にする
+         lastReceivedTime = "リセット済み";
+         await replyMessage(event.replyToken, "カウントをリセットしました。");
+         
+         // ★応用：もしM5Stick側のカウントも0に戻したい場合、
+         // ここからM5Stickへ通信するのは難しい（M5はサーバーではないため）。
+         // M5Stick側が定期的にサーバーへ「リセット命令出てない？」と聞きに行く仕組みが必要になります。
+         // ですので、とりあえず「サーバー上の見た目の数値だけリセット」が無難です。
+        }else {
             // それ以外の場合は使い方を返信
             await replyMessage(event.replyToken, "「状況」と送ると、現在の投函数を確認できます。");
         }
