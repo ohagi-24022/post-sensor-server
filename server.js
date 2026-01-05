@@ -1,72 +1,119 @@
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
-const line = require('@line/bot-sdk');
+// server.js
+require("dotenv").config();
 
-// 環境変数からLINEの設定を読み込む (Renderで設定します)
-const config = {
-    channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
-    channelSecret: process.env.CHANNEL_SECRET,
-};
-
+const LINE_TOKEN = process.env.LINE_TOKEN;
+const USER_ID = process.env.LINE_USER_ID;
+const express = require("express");
+const axios = require("axios");
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server);
 
-// --- LINE Bot用の設定 (Webhook) ---
-// LINEからの通信は /callback というURLで受け取ります
-app.post('/callback', line.middleware(config), (req, res) => {
-    Promise.all(req.body.events.map(handleLineEvent))
-        .then((result) => res.json(result))
-        .catch((err) => {
-            console.error(err);
-            res.status(500).end();
-        });
+app.use(express.json());
+
+// ------------------------------------------------------
+// サーバー側で保持するデータ
+// ------------------------------------------------------
+let currentCount = 0;
+let lastReceivedTime = "なし";
+let resetCommand = false; // ★追加：M5Stickへのリセット命令フラグ
+
+// ------------------------------------------------------
+// M5Stick → Server: 「リセット命令出てますか？」と聞きに来る場所 (★新規追加)
+// ------------------------------------------------------
+app.get("/check-reset", (req, res) => {
+  // 現在のフラグの状態を返す
+  res.json({ reset: resetCommand });
+
+  // 一度伝えたらフラグを下ろす（falseに戻す）
+  if (resetCommand) {
+    console.log("Reset command picked up by device");
+    resetCommand = false;
+  }
 });
 
-// LINEイベントを処理する関数
-async function handleLineEvent(event) {
-    // テキストメッセージ以外は無視
-    if (event.type !== 'message' || event.message.type !== 'text') {
-        return Promise.resolve(null);
+// ------------------------------------------------------
+// M5Stick → Server: 投函検知＆通知リクエスト
+// ------------------------------------------------------
+app.post("/report-post", async (req, res) => {
+  try {
+    const newCount = req.body.count;
+
+    if (newCount !== undefined) {
+      currentCount = newCount;
+    }
+    
+    const now = new Date();
+    lastReceivedTime = now.toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" });
+    console.log(`Post received! Count: ${currentCount}`);
+
+    // ★変更：カウントが0かどうかでメッセージを変える
+    let messageText = "";
+    if (currentCount === 0) {
+        messageText = `🔄 カウントをリセットしました。\n現在のカウント: 0回`;
+    } else {
+        messageText = `📮 投函がありました！\n現在のカウント: ${currentCount}回\n時刻: ${lastReceivedTime}`;
     }
 
-    const userText = event.message.text;
+    await pushMessageToUser(messageText);
+    res.json({ status: "success" });
 
-    // 1. ブラウザ(Socket.io)にメッセージを送信（これで曲が予約されます）
-    io.emit('chat-message', userText);
+  } catch (error) {
+    console.error("Error in /report-post:", error);
+    res.status(500).json({ error: "Server error" });
+  }
+});
 
-    // 2. LINEユーザーに「受け付けました」と返信するためのクライアント作成
-    const client = new line.Client(config);
+// ------------------------------------------------------
+// LINE Webhook 受信
+// ------------------------------------------------------
+app.post("/webhook", async (req, res) => {
+  try {
+    const events = req.body.events;
+    if (!events || !Array.isArray(events)) return res.sendStatus(200);
 
-    // YouTubeのURLかどうかの簡易判定（返信メッセージを変えるため）
-    const isUrl = userText.includes('youtube.com') || userText.includes('youtu.be');
-    const replyText = isUrl 
-        ? `🎵 リクエストを受け付けました！\nPC画面を確認してください。` 
-        : `💬 メッセージを送信しました: ${userText}`;
+    for (const event of events) {
+      if (event.type === "message" && event.message.type === "text") {
+        const text = event.message.text.trim();
 
-    return client.replyMessage(event.replyToken, {
-        type: 'text',
-        text: replyText
-    });
+        if (text === "状況" || text === "確認" || text === "status") {
+            const replyText = `現在の投函数: ${currentCount}回\n最終検知: ${lastReceivedTime}`;
+            await replyMessage(event.replyToken, replyText);
+
+        } else if (text === "リセット") {
+             // ★変更：M5Stickへ命令を出すためにフラグをONにする
+             resetCommand = true; 
+             currentCount = 0;
+             lastReceivedTime = "リセット済み";
+             
+             // LINEには「命令を受け付けました」と返す
+             await replyMessage(event.replyToken, "リセット命令を出しました。\n数秒以内にM5Stickの画面も0になります。");
+        }
+      }
+    }
+    res.sendStatus(200);
+  } catch (e) {
+    console.error("Webhook error:", e);
+    res.sendStatus(500);
+  }
+});
+
+// （以下の共通関数などは変更なし）
+async function pushMessageToUser(text) {
+  try {
+    await axios.post("https://api.line.me/v2/bot/message/push", 
+      { to: USER_ID, messages: [{ type: "text", text: text }] },
+      { headers: { "Content-Type": "application/json", Authorization: `Bearer ${LINE_TOKEN}` } }
+    );
+  } catch (error) { console.log("Push Error:", error.message); }
 }
 
-// --- Webサイトの公開設定 ---
-// LINEの処理より後に書くのがポイントですが、staticは干渉しないのでここでもOK
-app.use(express.static('public'));
+async function replyMessage(replyToken, text) {
+  try {
+    await axios.post("https://api.line.me/v2/bot/message/reply",
+      { replyToken, messages: [{ type: "text", text }] },
+      { headers: { "Content-Type": "application/json", Authorization: `Bearer ${LINE_TOKEN}` } }
+    );
+  } catch (error) { console.log("Reply Error:", error.message); }
+}
 
-// --- Socket.io (ブラウザ間の通信) ---
-io.on('connection', (socket) => {
-    console.log('Webユーザーが接続しました');
-
-    // Web画面からの入力も同様に全員へ転送
-    socket.on('chat-message', (msg) => {
-        io.emit('chat-message', msg);
-    });
-});
-
-// サーバー起動
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-});
+const port = process.env.PORT || 3000;
+app.listen(port, () => { console.log("Server running on " + port); });
